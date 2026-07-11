@@ -1,0 +1,373 @@
+name: Desktop & Android builds
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: desktop-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: win
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Activate pnpm 10
+        run: corepack prepare pnpm@10 --activate
+
+      - name: Verify toolchain
+        run: |
+          node -v
+          pnpm -v
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          corepack enable
+          corepack prepare pnpm@10 --activate
+          pnpm config set ignore-workspace-root-check true
+          rm -rf node_modules
+          pnpm install --frozen-lockfile --no-optional=false
+
+      - name: Ensure native Windows deps
+        if: matrix.platform == 'win'
+        shell: bash
+        run: |
+          pnpm -w add -D @rollup/rollup-win32-x64-msvc@4.62.2
+          pnpm -w add -D lightningcss-win32-x64-msvc@1.32.0
+          pnpm -w add -D @tailwindcss/oxide-win32-x64-msvc@4.3.1
+
+      - name: Verify workspace deps
+        shell: bash
+        run: |
+          pnpm -v
+          pwd
+          ls -la node_modules/.bin | head -n 50 || true
+
+      - name: Sync desktop version from tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Setting @workspace/desktop version to $VERSION"
+          node -e "const f='artifacts/desktop/package.json';const fs=require('fs');const p=JSON.parse(fs.readFileSync(f));p.version=process.env.VERSION;fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n');"
+        env:
+          VERSION: ${{ github.ref_name }}
+
+      - name: Generate API client + Zod (codegen)
+        run: pnpm --filter @workspace/api-spec run codegen
+
+      - name: Build shared libraries
+        run: pnpm run typecheck:libs
+
+      - name: Build API server bundle
+        run: pnpm --filter @workspace/api-server run build
+
+      - name: Build web dashboard
+        env:
+          PORT: "5000"
+          BASE_PATH: "/"
+          NODE_ENV: "production"
+        run: pnpm --filter @workspace/engram run build
+
+      - name: Build desktop main + stage resources
+        run: pnpm --filter @workspace/desktop run build
+
+      - name: Package installer (${{ matrix.platform }})
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ELECTRON_BUILDER_DISABLE_UPDATE_INFO: "true"
+        run: pnpm --filter @workspace/desktop exec electron-builder --${{ matrix.platform }} --publish ${{ github.ref_type == 'tag' && 'always' || 'never' }}
+
+      - name: Smoke test packaged app
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb
+            xvfb-run -a pnpm --filter @workspace/desktop run smoke
+          else
+            pnpm --filter @workspace/desktop run smoke
+          fi
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: engram-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            artifacts/desktop/release/*.AppImage
+            artifacts/desktop/release/*.deb
+            artifacts/desktop/release/*.dmg
+            artifacts/desktop/release/*.exe
+            artifacts/desktop/release/*.zip
+
+  android:
+    name: android
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Activate pnpm 10
+        run: corepack prepare pnpm@10 --activate
+
+      - name: Verify toolchain
+        run: |
+          node -v
+          pnpm -v
+
+      - name: Setup Java (JDK 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          corepack enable
+          corepack prepare pnpm@10 --activate
+          pnpm config set ignore-workspace-root-check true
+          rm -rf node_modules
+          pnpm install --frozen-lockfile --no-optional=false
+
+      - name: Verify workspace deps
+        shell: bash
+        run: |
+          pnpm -v
+          pwd
+          ls -la node_modules/.bin | head -n 50 || true
+
+      - name: Sync mobile version
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const f = "artifacts/engram-mobile/app.json";
+            const j = JSON.parse(fs.readFileSync(f, "utf8"));
+            const current = j.expo.version || "1.0.0";
+            const version =
+              process.env.REF_TYPE === "tag"
+                ? (process.env.REF_NAME || "").replace(/^v/, "")
+                : current;
+            j.expo.version = version;
+            j.expo.android = j.expo.android || {};
+            j.expo.android.versionCode = Number(process.env.RUN_NUMBER) || 1;
+            fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n");
+            fs.appendFileSync(process.env.GITHUB_ENV, "APK_VERSION=" + version + "\n");
+            console.log("mobile version " + version + " (code " + j.expo.android.versionCode + ")");
+          '
+
+      - name: Generate API client + Zod (codegen)
+        run: pnpm --filter @workspace/api-spec run codegen
+
+      - name: Build shared libraries
+        run: pnpm run typecheck:libs
+
+      - name: Expo prebuild (android)
+        run: pnpm --filter @workspace/engram-mobile exec expo prebuild --platform android --no-install --clean
+
+      - name: Build release APK
+        working-directory: artifacts/engram-mobile/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Stage APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="artifacts/engram-mobile/android/app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$SRC" ]; then
+            echo "Expected APK not found at $SRC" >&2
+            ls -la "artifacts/engram-mobile/android/app/build/outputs/apk/release/" || true
+            exit 1
+          fi
+          mkdir -p artifacts/engram-mobile/dist-apk
+          DEST="artifacts/engram-mobile/dist-apk/ENGRAM-Mobile-${APK_VERSION}.apk"
+          cp "$SRC" "$DEST"
+          echo "APK_PATH=$DEST" >> "$GITHUB_ENV"
+          echo "Staged $DEST"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: engram-android
+          if-no-files-found: error
+          path: artifacts/engram-mobile/dist-apk/*.apk
+
+      - name: Publish APK to draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Resolving draft release named '$TAG' in $REPO"
+          RELEASE_ID="$(gh api "repos/$REPO/releases" --paginate \
+            --jq ".[] | select(.draft == true and (.tag_name == \"$TAG\" or .name == \"$TAG\")) | .id" \
+            | head -n1)"
+          if [ -z "$RELEASE_ID" ]; then
+            echo "No draft release found for tag '$TAG' (did the desktop build create it?)." >&2
+            exit 1
+          fi
+          APK_NAME="$(basename "$APK_PATH")"
+          echo "Draft release id $RELEASE_ID; uploading $APK_NAME"
+          EXISTING="$(gh api "repos/$REPO/releases/$RELEASE_ID/assets" --paginate \
+            --jq ".[] | select(.name == \"$APK_NAME\") | .id" | head -n1)"
+          if [ -n "$EXISTING" ]; then
+            echo "Removing existing asset id $EXISTING for an idempotent re-run"
+            gh api -X DELETE "repos/$REPO/releases/assets/$EXISTING"
+          fi
+          curl --fail -sS \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/vnd.android.package-archive" \
+            --data-binary @"$APK_PATH" \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$APK_NAME"
+          echo "APK uploaded to draft release."
+
+  publish-dev:
+    name: Publish dev pre-release
+    needs: [build, android]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all installers + APK
+        uses: actions/download-artifact@v4
+        with:
+          pattern: engram-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create pre-release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="dev-build-${RUN_NUMBER}"
+          echo "Creating pre-release '$TAG' in $REPO (target $SHA)"
+          mapfile -t ASSETS < <(find release-assets -type f | sort)
+          echo "Assets to upload:"
+          printf '  %s\n' "${ASSETS[@]}"
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --target "$SHA" \
+            --title "Dev build #${RUN_NUMBER}" \
+            --notes "Manual workflow_dispatch build. Commit: ${SHA}." \
+            --prerelease \
+            "${ASSETS[@]}"
+          echo "Pre-release '$TAG' published."
+
+  publish:
+    name: Publish release
+    needs: [build, android]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Un-draft the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Looking for draft release named '$TAG' in $REPO"
+          RELEASE_ID="$(gh api "repos/$REPO/releases" --paginate \
+            --jq ".[] | select(.draft == true and (.tag_name == \"$TAG\" or .name == \"$TAG\")) | .id" \
+            | head -n1)"
+          if [ -z "$RELEASE_ID" ]; then
+            echo "No draft release found for tag '$TAG' — nothing to publish." >&2
+            exit 1
+          fi
+          echo "Publishing draft release id $RELEASE_ID"
+          gh api -X PATCH "repos/$REPO/releases/$RELEASE_ID" \
+            -F draft=false \
+            -f tag_name="$TAG" \
+            -f make_latest=true >/dev/null
+          echo "Release '$TAG' is now public."
