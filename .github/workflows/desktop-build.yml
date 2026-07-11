@@ -314,6 +314,49 @@ jobs:
             "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$APK_NAME"
           echo "APK uploaded to draft release."
 
+  # On a manual workflow_dispatch run the desktop build uses `--publish never`
+  # (no tag → no version for electron-builder to target), so the .zip and .apk
+  # only exist as ephemeral workflow artifacts. This job downloads them all and
+  # creates a GitHub pre-release so they are permanently, publicly downloadable
+  # from the Releases page without a GitHub login.
+  publish-dev:
+    name: Publish dev pre-release
+    needs: [build, android]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all installers + APK
+        uses: actions/download-artifact@v4
+        with:
+          pattern: engram-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create pre-release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="dev-build-${RUN_NUMBER}"
+          echo "Creating pre-release '$TAG' in $REPO (target $SHA)"
+          mapfile -t ASSETS < <(find release-assets -type f | sort)
+          echo "Assets to upload:"
+          printf '  %s\n' "${ASSETS[@]}"
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --target "$SHA" \
+            --title "Dev build #${RUN_NUMBER}" \
+            --notes "Manual workflow_dispatch build. Commit: ${SHA}." \
+            --prerelease \
+            "${ASSETS[@]}"
+          echo "Pre-release '$TAG' published."
+
   # Flip the draft Release to public only after ALL desktop build jobs AND the
   # android job have finished uploading their installers, the APK, + update
   # manifests, so users never land on a half-finished release. Runs only on a
