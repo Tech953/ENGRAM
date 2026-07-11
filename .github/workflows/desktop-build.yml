@@ -60,7 +60,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --include=optional
 
       # On a tag push (v1.2.3) set the desktop package version to match the tag,
       # so the published release + update manifest carry the right version and
@@ -199,7 +199,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --include=optional
 
       # Sync the mobile app version from the pushed tag (mirroring the desktop
       # version sync) and stamp an integer versionCode from the CI run number so
