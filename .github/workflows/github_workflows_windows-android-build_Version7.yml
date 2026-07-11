@@ -1,0 +1,208 @@
+name: Windows + Android Build (Capacitor)
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-android-build:
+    name: Windows + Android Build
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    env:
+      CI: true
+      # Release builds only on main branch pushes or version tags.
+      IS_RELEASE_CONTEXT: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect npm lockfile
+        id: npm_lock
+        shell: pwsh
+        run: |
+          if (Test-Path "package-lock.json" -or Test-Path "npm-shrinkwrap.json") {
+            "has_lock=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "has_lock=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: ${{ steps.npm_lock.outputs.has_lock == 'true' && 'npm' || '' }}
+
+      - name: Setup Java (Temurin 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licenses
+        shell: pwsh
+        run: |
+          yes | sdkmanager --licenses | Out-Null
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          if (Test-Path "package-lock.json" -or Test-Path "npm-shrinkwrap.json") {
+            npm ci
+          } else {
+            npm install
+          }
+
+      - name: Run lint (if present)
+        shell: pwsh
+        run: |
+          npm run | Select-String -Pattern '^  lint$' -Quiet
+          if ($LASTEXITCODE -eq 0) {
+            npm run lint
+          } else {
+            Write-Host "No lint script found; skipping."
+          }
+
+      - name: Run tests (if present)
+        shell: pwsh
+        run: |
+          npm run | Select-String -Pattern '^  test$' -Quiet
+          if ($LASTEXITCODE -eq 0) {
+            npm test -- --ci
+          } else {
+            Write-Host "No test script found; skipping."
+          }
+
+      - name: Build web assets
+        shell: pwsh
+        run: npm run build
+
+      - name: Capacitor sync android
+        shell: pwsh
+        run: npx cap sync android
+
+      - name: Build debug APK
+        shell: pwsh
+        working-directory: android
+        run: .\gradlew.bat --no-daemon assembleDebug
+
+      - name: Decode keystore (release only)
+        if: env.IS_RELEASE_CONTEXT == 'true'
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.ANDROID_KEYSTORE_BASE64 }}")) {
+            throw "ANDROID_KEYSTORE_BASE64 secret is missing."
+          }
+          $bytes = [Convert]::FromBase64String("${{ secrets.ANDROID_KEYSTORE_BASE64 }}")
+          [IO.File]::WriteAllBytes("android/app/release.keystore", $bytes)
+
+      - name: Create key.properties (release only)
+        if: env.IS_RELEASE_CONTEXT == 'true'
+        shell: pwsh
+        run: |
+          if (
+            [string]::IsNullOrWhiteSpace("${{ secrets.ANDROID_KEYSTORE_PASSWORD }}") -or
+            [string]::IsNullOrWhiteSpace("${{ secrets.ANDROID_KEY_ALIAS }}") -or
+            [string]::IsNullOrWhiteSpace("${{ secrets.ANDROID_KEY_PASSWORD }}")
+          ) {
+            throw "One or more Android signing secrets are missing."
+          }
+
+          @"
+          storeFile=release.keystore
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          "@ | Set-Content -Path "android/key.properties"
+
+      - name: Build release APK + AAB (release only)
+        if: env.IS_RELEASE_CONTEXT == 'true'
+        shell: pwsh
+        working-directory: android
+        run: .\gradlew.bat --no-daemon assembleRelease bundleRelease
+
+      - name: Collect artifacts
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          $patterns = @(
+            "android/app/build/outputs/**/*.apk",
+            "android/app/build/outputs/**/*.aab",
+            "android/build/reports/**",
+            "android/**/build/outputs/mapping/**"
+          )
+
+          $files = @()
+          foreach ($p in $patterns) {
+            $files += Get-ChildItem -Path $p -Recurse -File -ErrorAction SilentlyContinue
+          }
+
+          $files = $files | Sort-Object FullName -Unique
+
+          if ($files.Count -eq 0) {
+            Write-Host "No artifacts found."
+          } else {
+            foreach ($f in $files) {
+              $safeName = ($f.FullName.Substring((Resolve-Path .).Path.Length).TrimStart('\')) -replace '[\\/:*?"<>|]', '_'
+              Copy-Item -Path $f.FullName -Destination (Join-Path "artifacts" $safeName) -Force
+              Write-Host "Collected: $($f.FullName)"
+            }
+          }
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-android-build-artifacts
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summarize artifact outputs
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Build Artifact Summary"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Release context: **$env:IS_RELEASE_CONTEXT**"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Ref: **${{ github.ref }}**"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Event: **${{ github.event_name }}**"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+
+          if (Test-Path "artifacts") {
+            $artifactFiles = Get-ChildItem -Path "artifacts" -File -Recurse -ErrorAction SilentlyContinue
+            if ($artifactFiles.Count -gt 0) {
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "| File | Size |"
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "|---|---:|"
+              foreach ($f in $artifactFiles) {
+                $sizeMB = [Math]::Round($f.Length / 1MB, 2)
+                $relative = $f.FullName.Substring((Resolve-Path .).Path.Length).TrimStart('\')
+                Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "| `$relative` | ${sizeMB} MB |"
+              }
+            } else {
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "No artifacts were produced."
+            }
+          } else {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Artifacts directory not found."
+          }
+
+      - name: Cleanup signing files
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -Path "android/key.properties" -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "android/app/release.keystore" -Force -ErrorAction SilentlyContinue
