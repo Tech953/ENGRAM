@@ -1,0 +1,149 @@
+appId: ai.pyri.engram
+productName: ENGRAM
+executableName: engram
+copyright: ENGRAM — PYRI AI Persona Framework
+
+directories:
+  output: release
+  buildResources: build
+
+artifactName: ${productName}-${version}-${arch}.${ext}
+
+# Prevent channel/update metadata generation on non-publish paths in CI.
+generateUpdatesFilesForAllChannels: false
+
+# Release feed for auto-update (electron-updater). At package time
+# electron-builder bakes provider+owner+repo into app-update.yml inside the app,
+# and `--publish` (see .github/workflows/desktop-build.yml) uploads the
+# installers + the *-latest*.yml update manifests to a GitHub Release for the
+# pushed tag.
+#
+# releaseType is `draft` (not `release`): each OS matrix job uploads into a
+# hidden draft Release, so a partially-uploaded release is never publicly
+# visible and concurrent first-creators don't race a public release into
+# existence. A final CI job (`publish`, needs: build) flips the draft to public
+# once all three OS installers + manifests are attached. The published release
+# is still public and requires no GitHub login to download.
+publish:
+  provider: github
+  owner: Tech953
+  repo: ENGRAM
+  releaseType: draft
+  channel: latest
+  vPrefixedTagName: true
+
+# Native modules: none. PGlite ships as prebuilt wasm via extraResources.
+npmRebuild: false
+asar: true
+
+# Only the Electron main/preload bundle goes inside the asar archive.
+files:
+  - dist/**/*
+  - package.json
+
+# Everything the embedded server needs lives outside the asar, under
+# process.resourcesPath at runtime (server/, web/, drizzle/).
+extraResources:
+  - from: resources/server
+    to: server
+  # The server bundle externalizes @electric-sql/pglite and imports it as a bare
+  # ESM specifier, so it must resolve from a real node_modules dir next to the
+  # bundle. electron-builder strips `node_modules` when copying a directory
+  # `from`, so the pglite package is copied via its own entry (whose `from` is
+  # the package dir itself, not a node_modules dir) to land it in place.
+  - from: resources/server/node_modules/@electric-sql/pglite
+    to: server/node_modules/@electric-sql/pglite
+  - from: resources/web
+    to: web
+  - from: resources/drizzle
+    to: drizzle
+  # ffmpeg + ffprobe (host-platform binaries staged by prepare-resources.mjs).
+  # The embedded server child spawns these for the VIDEO modality; main.ts points
+  # it at them via FFMPEG_PATH/FFPROBE_PATH so video perception works fully offline
+  # with no system ffmpeg install. On macOS, signed/notarized builds also sign
+  # these binaries — see the `mac.binaries` list below (they are unsigned Mach-O
+  # executables that notarization would otherwise reject).
+  - from: resources/bin
+    to: bin
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Science
+  synopsis: PYRI — AI persona framework (offline-capable)
+
+deb:
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+
+mac:
+  target:
+    - dmg
+  category: public.app-category.productivity
+  # Signing + notarization. Signing is opt-in via env: provide a Developer ID
+  # certificate through CSC_LINK / CSC_KEY_PASSWORD. With no certificate present
+  # electron-builder skips signing entirely (and therefore notarization too), so
+  # local/unsigned builds keep working.
+  #
+  # Gatekeeper on modern macOS requires BOTH a Developer ID signature AND Apple
+  # notarization — a signed-but-unnotarized app still shows the "unidentified
+  # developer" / malware warning. Notarization needs the hardened runtime, which
+  # in turn needs the JIT/library entitlements below or the notarized app crashes
+  # at launch.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.inherit.plist
+  # The bundled ffmpeg/ffprobe (staged into Contents/Resources/bin by
+  # prepare-resources.mjs) are third-party, unsigned Mach-O executables. A
+  # notarized build requires EVERY executable inside the app to carry a Developer
+  # ID signature with the hardened runtime — otherwise the notary service rejects
+  # the app (or Gatekeeper blocks it at launch). Listing them here makes signing
+  # explicit and guaranteed: electron-builder resolves each path relative to the
+  # .app and hands them to @electron/osx-sign, which signs them with the same
+  # hardened runtime + inherit entitlements + secure timestamp as the rest of the
+  # bundle. Paths are relative to the .app's Contents (no extension on macOS).
+  # This is a no-op for unsigned local/CI builds (signing is skipped without a
+  # cert), so those keep working unchanged.
+  binaries:
+    - Contents/Resources/bin/ffmpeg
+    - Contents/Resources/bin/ffprobe
+  # notarize runs only after a successful sign, and only when Apple credentials
+  # are present in the environment (APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD +
+  # APPLE_TEAM_ID, or the APPLE_API_KEY trio); otherwise it is skipped gracefully.
+  notarize: true
+
+win:
+  target:
+    - nsis
+    # Portable .zip alongside the NSIS installer: an unpacked, no-install build
+    # the user extracts and runs (engram.exe) without admin rights, for users who
+    # can't or don't want to run the installer. NOTE: the Windows update feed
+    # (latest.yml) targets the NSIS .exe, and setupAutoUpdates() in main.ts gates
+    # only on app.isPackaged — so a portable copy that checks for updates would
+    # fetch and run that .exe installer. The installer is the primary
+    # auto-updating distribution; the .zip is for no-install use. Adds no per-OS
+    # cost and ships in the same release.
+    - zip
+  # Authenticode signing is opt-in via WIN_CSC_LINK / WIN_CSC_KEY_PASSWORD
+  # (electron-builder maps these to the certificate file + password). With no
+  # certificate the executable is left unsigned. A timestamp countersignature
+  # keeps the signature valid after the signing certificate eventually expires,
+  # and SHA-256 is required for SmartScreen to trust the signature.
+  signtoolOptions:
+    signingHashAlgorithms:
+      - sha256
+    rfc3161TimeStampServer: http://timestamp.digicert.com
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
