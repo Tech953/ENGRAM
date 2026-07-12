@@ -1,0 +1,41 @@
+{
+  "name": "@workspace/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ENGRAM — PYRI AI Persona Framework, packaged as a native desktop app (Electron).",
+  "author": {
+    "name": "ENGRAM",
+    "email": "support@pyri.ai"
+  },
+  "homepage": "https://pyri.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tech953/ENGRAM.git"
+  },
+  "main": "dist/main.cjs",
+  "scripts": {
+    "build:main": "node ./build.mjs",
+    "prepare:resources": "node ./scripts/prepare-resources.mjs",
+    "build": "node ./build.mjs && node ./scripts/prepare-resources.mjs",
+    "dist": "pnpm run build && electron-builder --linux",
+    "dist:all": "pnpm run build && electron-builder -mwl",
+    "smoke": "node ./scripts/smoke-test.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "debug:dist": "node -e \"const fs=require('fs');const p='dist/main.cjs';console.log('main=',require('./package.json').main);console.log('exists dist/main.cjs =',fs.existsSync(p));\""
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "electron": "^42.5.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "0.27.3",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0",
+    "playwright-core": "^1.61.1",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  }
+}
